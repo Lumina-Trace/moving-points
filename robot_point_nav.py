@@ -2,7 +2,6 @@
 """通过 Movebase3D HTTP API 让机器人导航到已保存点位。"""
 
 import argparse
-import base64
 import json
 import sys
 import urllib.error
@@ -13,12 +12,50 @@ import urllib.request
 class RobotAPI:
     def __init__(self, host: str, username: str | None, password: str | None):
         self.base_url = host.rstrip("/")
-        self.headers = {"Accept": "application/json"}
+        self._session_cookie: str | None = None
         if username is not None:
-            token = base64.b64encode(f"{username}:{password or ''}".encode()).decode()
-            self.headers["Authorization"] = f"Basic {token}"
+            self._login(username, password or "")
 
-    def get(self, path: str, **query):
+    def _login(self, username: str, password: str):
+        """POST /api/auth/login 获取 session cookie，后续请求自动携带。"""
+        url = f"{self.base_url}/api/auth/login"
+        data = json.dumps({"username": username, "password": password}).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                # 从 Set-Cookie 响应头提取 session 值
+                for header_name, header_value in response.getheaders():
+                    if header_name.lower() == "set-cookie":
+                        for part in header_value.split(";"):
+                            part = part.strip()
+                            if part.lower().startswith("session="):
+                                self._session_cookie = part.split("=", 1)[1].strip()
+                result = json.loads(response.read().decode("utf-8"))
+                if result.get("success") is False:
+                    raise RuntimeError(
+                        result.get("message") or result.get("msg") or "登录失败"
+                    )
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"登录失败 HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"无法连接机器人服务：{exc.reason}") from exc
+
+    def _build_headers(self) -> dict:
+        headers = {"Accept": "application/json"}
+        if self._session_cookie:
+            headers["Cookie"] = f"session={self._session_cookie}"
+        return headers
+
+    def _request(self, method: str, path: str, data=None, **query):
         query_string = urllib.parse.urlencode(
             {key: value for key, value in query.items() if value is not None}
         )
@@ -26,7 +63,9 @@ class RobotAPI:
         if query_string:
             url += f"?{query_string}"
 
-        request = urllib.request.Request(url, headers=self.headers, method="GET")
+        request = urllib.request.Request(
+            url, data=data, headers=self._build_headers(), method=method
+        )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -35,6 +74,9 @@ class RobotAPI:
             raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"无法连接机器人服务：{exc.reason}") from exc
+
+    def get(self, path: str, **query):
+        return self._request("GET", path, **query)
 
     def health(self):
         return self.get("/health")
@@ -87,8 +129,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description="控制机器人导航到已保存点位")
     parser.add_argument("target", nargs="?", help="目标点位名称或 ID")
     parser.add_argument("--host", default="http://127.0.0.1:9000", help="Web API 地址")
-    parser.add_argument("--username", help="HTTP Basic 用户名")
-    parser.add_argument("--password", help="HTTP Basic 密码")
+    parser.add_argument("--username", help="登录用户名（默认无认证）")
+    parser.add_argument("--password", help="登录密码")
     parser.add_argument("--map", dest="map_name", help="地图名称（同名点位时建议指定）")
     parser.add_argument("--list", action="store_true", help="列出点位，不移动机器人")
     return parser
